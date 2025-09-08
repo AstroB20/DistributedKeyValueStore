@@ -1,17 +1,17 @@
 import asyncio
-import json
 import logging
 import time
-from typing import Dict, List, Optional, Set
-from fastapi import FastAPI, HTTPException
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI
 from pydantic import BaseModel
 import httpx
 import uvicorn
+
 from consistent_hash import ConsistentHashRing
 from replication import ReplicationManager
 from leader_election import LeaderElection
 
-# Request/Response models
 class PutRequest(BaseModel):
     key: str
     value: str
@@ -34,48 +34,45 @@ class DistributedNode:
         self.port = port
         self.peers = peers
         self.storage: Dict[str, str] = {}
-        
-        # Initialize distributed systems components
+
         all_nodes = peers + [f"{host}:{port}"]
         self.hash_ring = ConsistentHashRing(all_nodes)
         self.replication_manager = ReplicationManager(self, replicas=2)
         self.leader_election = LeaderElection(self)
-        
-        # FastAPI app
+
         self.app = FastAPI(title=f"KV-Store Node {node_id}")
         self.setup_routes()
-        
-        # HTTP client for peer communication
+
         self.client = httpx.AsyncClient(timeout=5.0)
-        
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+        logging.basicConfig(level=logging.INFO,
+                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(f"Node-{node_id}")
+
+    # Background anti-entropy repair task
     async def anti_entropy_repair(self):
-        """Periodically reconcile keys with replica nodes and repair missing data"""
         while True:
             try:
                 all_keys = set(self.storage.keys())
                 replica_nodes = [peer for peer in self.peers]
                 for key in all_keys:
-                    # Check replicas and ensure they have the key
                     expected_replicas = self.hash_ring.get_replica_nodes(key, self.replication_manager.replica_count)
+
                     for replica in expected_replicas:
                         if replica == f"{self.host}:{self.port}":
                             continue
                         if replica not in replica_nodes:
                             continue
-                        # Ask replica if it has the key
                         try:
                             response = await self.client.get(f"http://{replica}/get/{key}")
                             if response.status_code == 200:
                                 data = response.json()
                                 if not data.get("found"):
-                                    # Repair replica
                                     await self.replication_manager._replicate_to_node(replica, "PUT", key, self.storage[key])
                                     self.logger.info(f"🔧 Repaired key {key} on replica {replica}")
                         except Exception as e:
                             self.logger.warning(f"Anti-entropy: Failed to contact {replica}: {e}")
-                await asyncio.sleep(60)  # Run every minute
+                await asyncio.sleep(60)
             except Exception as e:
                 self.logger.error(f"Anti-entropy repair error: {e}")
                 await asyncio.sleep(60)
@@ -84,15 +81,15 @@ class DistributedNode:
         @self.app.put("/put")
         async def put_key(request: PutRequest):
             return await self.handle_put(request.key, request.value)
-            
+
         @self.app.get("/get/{key}")
         async def get_key(key: str):
             return await self.handle_get(key)
-            
+
         @self.app.delete("/delete/{key}")
         async def delete_key(key: str):
             return await self.handle_delete(key)
-            
+
         @self.app.get("/status")
         async def get_status():
             return NodeStatus(
@@ -102,37 +99,36 @@ class DistributedNode:
                 keys_count=len(self.storage),
                 leader_id=self.leader_election.current_leader
             )
-            
-        # Internal endpoints for replication
+
+        # Internal replication endpoint
         @self.app.post("/internal/replicate")
         async def replicate_data(request: dict):
             key = request["key"]
             value = request.get("value")
             operation = request["operation"]
-            
             if operation == "PUT":
                 self.storage[key] = value
                 self.logger.info(f"🔄 Replicated PUT {key}={value}")
             elif operation == "DELETE":
                 self.storage.pop(key, None)
                 self.logger.info(f"🔄 Replicated DELETE {key}")
-                
             return {"status": "replicated", "node": self.node_id}
-            
+
+        # Heartbeat and leader election internal endpoints
         @self.app.post("/internal/heartbeat")
         async def heartbeat():
             return {"node_id": self.node_id, "timestamp": time.time(), "status": "alive"}
 
-        # Leader election endpoints
         @self.app.post("/internal/leader_announce")
         async def leader_announce(announcement: dict):
             self.leader_election.handle_leader_announcement(announcement)
             return {"status": "acknowledged"}
 
-        @self.app.post("/internal/leader_heartbeat") 
+        @self.app.post("/internal/leader_heartbeat")
         async def leader_heartbeat(heartbeat: dict):
             self.leader_election.handle_leader_heartbeat(heartbeat)
             return {"status": "received"}
+
     async def handle_put(self, key: str, value: str):
         primary_node = self.hash_ring.get_primary_node(key)
         self_address = f"{self.host}:{self.port}"
@@ -147,17 +143,16 @@ class DistributedNode:
         else:
             self.logger.info(f"📤 Forwarding PUT {key} to {primary_node}")
             return await self.forward_request(primary_node, "PUT", key, value)
+
     async def handle_get(self, key: str):
         primary_node = self.hash_ring.get_primary_node(key)
         self_address = f"{self.host}:{self.port}"
-
-        # Try primary node first
         if primary_node == self_address:
             if key in self.storage:
                 self.logger.info(f"📖 Found {key} locally (primary)")
                 return GetResponse(value=self.storage[key], found=True)
             else:
-                # Try replicas if not found locally (failover for missing key)
+                # Try replicas if not found locally
                 replica_nodes = self.hash_ring.get_replica_nodes(key, self.replication_manager.replica_count)
                 for replica in replica_nodes:
                     if replica != self_address:
@@ -172,7 +167,6 @@ class DistributedNode:
                             self.logger.warning(f"Failed to contact replica {replica}: {e}")
                 return GetResponse(found=False)
         else:
-            # Try primary node
             try:
                 response = await self.client.get(f"http://{primary_node}/get/{key}")
                 if response.status_code == 200:
@@ -181,8 +175,7 @@ class DistributedNode:
                         return GetResponse(value=data["value"], found=True)
             except Exception as e:
                 self.logger.warning(f"Primary node {primary_node} unreachable, trying replicas: {e}")
-
-            # Failover to replicas if primary unreachable
+            # Failover to replicas
             replica_nodes = self.hash_ring.get_replica_nodes(key, self.replication_manager.replica_count)
             for replica in replica_nodes:
                 if replica != primary_node:
@@ -196,11 +189,10 @@ class DistributedNode:
                     except Exception as e:
                         self.logger.warning(f"Replica {replica} unreachable: {e}")
             return GetResponse(found=False)
+
     async def handle_delete(self, key: str):
-        """Handle DELETE request with replication"""
         primary_node = self.hash_ring.get_primary_node(key)
         self_address = f"{self.host}:{self.port}"
-        
         if primary_node == self_address:
             deleted = self.storage.pop(key, None) is not None
             if deleted:
@@ -210,20 +202,17 @@ class DistributedNode:
         else:
             self.logger.info(f"📤 Forwarding DELETE {key} to {primary_node}")
             return await self.forward_request(primary_node, "DELETE", key)
-    
+
     async def forward_request(self, target_node: str, operation: str, key: str, value: str = None):
-        """Forward request to the responsible node"""
         try:
             if operation == "PUT":
-                response = await self.client.put(
-                    f"http://{target_node}/put",
-                    json={"key": key, "value": value}
-                )
+                response = await self.client.put(f"http://{target_node}/put", json={"key": key, "value": value})
             elif operation == "GET":
                 response = await self.client.get(f"http://{target_node}/get/{key}")
             elif operation == "DELETE":
                 response = await self.client.delete(f"http://{target_node}/delete/{key}")
-            
+            else:
+                return None
             return response.json() if response.status_code == 200 else None
         except Exception as e:
             self.logger.error(f"Failed to forward {operation} to {target_node}: {e}")
@@ -232,37 +221,27 @@ class DistributedNode:
 # Global node instance for background tasks
 node_instance = None
 
-async def start_background_tasks():
-    """Start background tasks after server starts"""
-    if node_instance:
-        await node_instance.leader_election.start_election_loop()
-
 def create_app(node_id: str, host: str, port: int, peers: List[str]):
     global node_instance
     node_instance = DistributedNode(node_id, host, port, peers)
-    
+
     @node_instance.app.on_event("startup")
     async def startup_event():
-        # Start leader election loop
         asyncio.create_task(node_instance.leader_election.start_election_loop())
-        # Start background repair anti-entropy task
         asyncio.create_task(node_instance.anti_entropy_repair())
         node_instance.logger.info(f"🚀 Node {node_instance.node_id} started on {node_instance.host}:{node_instance.port}")
         node_instance.logger.info(f"👥 Peers: {node_instance.peers}")
 
-    
     return node_instance.app
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 4:
-        print("Usage: python node.py <node_id> <host> <port> <peer1:port1,peer2:port2,...>")
+        print("Usage: python node.py <node_id> <host> <port> <comma_separated_peers>")
         sys.exit(1)
-    
     node_id = sys.argv[1]
     host = sys.argv[2]
     port = int(sys.argv[3])
     peers = sys.argv[4].split(",") if len(sys.argv) > 4 and sys.argv[4] else []
-    
     app = create_app(node_id, host, port, peers)
     uvicorn.run(app, host=host, port=port, log_level="info")

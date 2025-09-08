@@ -5,7 +5,6 @@ import httpx
 from typing import Optional
 
 class LeaderElection:
-
     def __init__(self, node):
         self.node = node
         self.is_leader = False
@@ -20,15 +19,12 @@ class LeaderElection:
         """Main leader election loop"""
         await asyncio.sleep(3)  # Initial delay for cluster stabilization
         self.logger.info("🗳️ Starting leader election process...")
-
         while True:
             try:
                 if not self.is_leader and not self.election_in_progress and self._should_start_election():
                     await self._start_election()
-
                 elif self.is_leader:
                     await self._send_heartbeats()
-
                 else:
                     await asyncio.sleep(2)
 
@@ -49,7 +45,6 @@ class LeaderElection:
                         self.logger.warning(f"Peer {peer} health check unreachable")
 
                 await asyncio.sleep(self.heartbeat_interval)
-
             except Exception as e:
                 self.logger.error(f"Election loop error: {e}")
                 await asyncio.sleep(5)
@@ -65,31 +60,26 @@ class LeaderElection:
         """Start leader election using lowest-ID wins approach"""
         self.election_in_progress = True
         self.logger.info("🗳️ Starting leader election...")
-
         try:
             # Simple election: lowest node id becomes leader
             all_nodes = [f"{self.node.host}:{self.node.port}"] + self.node.peers
             active_nodes = await self._get_active_nodes(all_nodes)
-
             if active_nodes:
                 active_nodes.sort()
                 new_leader = active_nodes[0]
                 self.logger.info(f"🏆 Election result: {new_leader} should be leader")
-
                 if new_leader == f"{self.node.host}:{self.node.port}":
                     await self._become_leader()
                 else:
                     self._follow_leader(new_leader)
             else:
                 self.logger.warning("No active nodes found for election")
-
         finally:
             self.election_in_progress = False
 
     async def _get_active_nodes(self, nodes):
         """Get list of currently active nodes"""
         active_nodes = []
-
         for node in nodes:
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
@@ -102,7 +92,6 @@ class LeaderElection:
             except Exception as e:
                 self.logger.debug(f"❌ Node {node} unreachable: {e}")
                 continue
-
         self.logger.info(f"Active nodes: {active_nodes}")
         return active_nodes
 
