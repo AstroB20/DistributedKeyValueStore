@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  kvstore-node1:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - NODE_ID=node1
+      - HOST=0.0.0.0
+      - PORT=8001
+      - PEERS=kvstore-node2:8002,kvstore-node3:8003
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  kvstore-node2:
+    build: .
+    ports:
+      - "8002:8002"
+    environment:
+      - NODE_ID=node2
+      - HOST=0.0.0.0
+      - PORT=8002
+      - PEERS=kvstore-node1:8001,kvstore-node3:8003
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  kvstore-node3:
+    build: .
+    ports:
+      - "8003:8003"
+    environment:
+      - NODE_ID=node3
+      - HOST=0.0.0.0
+      - PORT=8003
+      - PEERS=kvstore-node1:8001,kvstore-node2:8002
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  default:
+    driver: bridge
