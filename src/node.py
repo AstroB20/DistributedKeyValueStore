@@ -50,7 +50,36 @@ class DistributedNode:
         
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(f"Node-{node_id}")
-        
+    async def anti_entropy_repair(self):
+        """Periodically reconcile keys with replica nodes and repair missing data"""
+        while True:
+            try:
+                all_keys = set(self.storage.keys())
+                replica_nodes = [peer for peer in self.peers]
+                for key in all_keys:
+                    # Check replicas and ensure they have the key
+                    expected_replicas = self.hash_ring.get_replica_nodes(key, self.replication_manager.replica_count)
+                    for replica in expected_replicas:
+                        if replica == f"{self.host}:{self.port}":
+                            continue
+                        if replica not in replica_nodes:
+                            continue
+                        # Ask replica if it has the key
+                        try:
+                            response = await self.client.get(f"http://{replica}/get/{key}")
+                            if response.status_code == 200:
+                                data = response.json()
+                                if not data.get("found"):
+                                    # Repair replica
+                                    await self.replication_manager._replicate_to_node(replica, "PUT", key, self.storage[key])
+                                    self.logger.info(f"🔧 Repaired key {key} on replica {replica}")
+                        except Exception as e:
+                            self.logger.warning(f"Anti-entropy: Failed to contact {replica}: {e}")
+                await asyncio.sleep(60)  # Run every minute
+            except Exception as e:
+                self.logger.error(f"Anti-entropy repair error: {e}")
+                await asyncio.sleep(60)
+
     def setup_routes(self):
         @self.app.put("/put")
         async def put_key(request: PutRequest):
@@ -104,57 +133,69 @@ class DistributedNode:
         async def leader_heartbeat(heartbeat: dict):
             self.leader_election.handle_leader_heartbeat(heartbeat)
             return {"status": "received"}
-
     async def handle_put(self, key: str, value: str):
-        """Handle PUT request with consistent hashing and replication"""
         primary_node = self.hash_ring.get_primary_node(key)
         self_address = f"{self.host}:{self.port}"
-        
         if primary_node == self_address:
-            # This node is responsible for the key
             self.storage[key] = value
             self.logger.info(f"📝 Stored {key}={value} locally (primary)")
-            
-            # Replicate to other nodes
-            await self.replication_manager.replicate_put(key, value)
-            return {"status": "stored", "node": self.node_id, "primary": True}
+            success = await self.replication_manager.replicate_put(key, value)
+            if success:
+                return {"status": "stored", "node": self.node_id, "primary": True}
+            else:
+                return {"status": "stored_with_warnings", "node": self.node_id, "primary": True}
         else:
-            # Forward to the responsible node
             self.logger.info(f"📤 Forwarding PUT {key} to {primary_node}")
             return await self.forward_request(primary_node, "PUT", key, value)
-    
     async def handle_get(self, key: str):
-        """Handle GET request with consistent hashing"""
         primary_node = self.hash_ring.get_primary_node(key)
         self_address = f"{self.host}:{self.port}"
-        
+
+        # Try primary node first
         if primary_node == self_address:
-            # Check local storage first
             if key in self.storage:
                 self.logger.info(f"📖 Found {key} locally (primary)")
                 return GetResponse(value=self.storage[key], found=True)
-            
-            # Try replicas
-            replica_nodes = self.hash_ring.get_replica_nodes(key, 2)
+            else:
+                # Try replicas if not found locally (failover for missing key)
+                replica_nodes = self.hash_ring.get_replica_nodes(key, self.replication_manager.replica_count)
+                for replica in replica_nodes:
+                    if replica != self_address:
+                        try:
+                            response = await self.client.get(f"http://{replica}/get/{key}")
+                            if response.status_code == 200:
+                                data = response.json()
+                                if data.get("found"):
+                                    self.logger.info(f"📖 Found {key} on replica {replica}")
+                                    return GetResponse(value=data["value"], found=True)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to contact replica {replica}: {e}")
+                return GetResponse(found=False)
+        else:
+            # Try primary node
+            try:
+                response = await self.client.get(f"http://{primary_node}/get/{key}")
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get("found"):
+                        return GetResponse(value=data["value"], found=True)
+            except Exception as e:
+                self.logger.warning(f"Primary node {primary_node} unreachable, trying replicas: {e}")
+
+            # Failover to replicas if primary unreachable
+            replica_nodes = self.hash_ring.get_replica_nodes(key, self.replication_manager.replica_count)
             for replica in replica_nodes:
-                if replica != self_address:
+                if replica != primary_node:
                     try:
                         response = await self.client.get(f"http://{replica}/get/{key}")
                         if response.status_code == 200:
                             data = response.json()
-                            if data["found"]:
-                                self.logger.info(f"📖 Found {key} on replica {replica}")
+                            if data.get("found"):
+                                self.logger.info(f"📖 Found {key} on replica {replica} (failover)")
                                 return GetResponse(value=data["value"], found=True)
                     except Exception as e:
-                        self.logger.warning(f"Failed to contact replica {replica}: {e}")
-            
+                        self.logger.warning(f"Replica {replica} unreachable: {e}")
             return GetResponse(found=False)
-        else:
-            # Forward to responsible node
-            self.logger.info(f"📤 Forwarding GET {key} to {primary_node}")
-            result = await self.forward_request(primary_node, "GET", key)
-            return result if result else GetResponse(found=False)
-    
     async def handle_delete(self, key: str):
         """Handle DELETE request with replication"""
         primary_node = self.hash_ring.get_primary_node(key)
@@ -202,10 +243,13 @@ def create_app(node_id: str, host: str, port: int, peers: List[str]):
     
     @node_instance.app.on_event("startup")
     async def startup_event():
-        # Start background tasks
+        # Start leader election loop
         asyncio.create_task(node_instance.leader_election.start_election_loop())
-        node_instance.logger.info(f"🚀 Node {node_id} started on {host}:{port}")
-        node_instance.logger.info(f"👥 Peers: {peers}")
+        # Start background repair anti-entropy task
+        asyncio.create_task(node_instance.anti_entropy_repair())
+        node_instance.logger.info(f"🚀 Node {node_instance.node_id} started on {node_instance.host}:{node_instance.port}")
+        node_instance.logger.info(f"👥 Peers: {node_instance.peers}")
+
     
     return node_instance.app
 
